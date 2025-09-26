@@ -1,0 +1,19 @@
+[project]
+name = "isocoder"
+version = "0.1.0"
+description = "Lightweight client for Isocoder TVAE on Modal"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+dependencies = [
+  "requests>=2.32.0",
+  "numpy>=1.23.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/yourname/isocoder"
+Repository = "https://github.com/yourname/isocoder"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
