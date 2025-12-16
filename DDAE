@@ -1,0 +1,232 @@
+# ddae/diffusion/ddpm.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import jax
+import jax.numpy as jnp
+import optax
+from flax import linen as nn
+from flax.training import train_state
+
+
+def cosine_alpha_bar(T: int, s: float = 0.008) -> jnp.ndarray:
+    """Cosine schedule for alpha_bar(t), t=0..T."""
+    steps = jnp.arange(T + 1, dtype=jnp.float32)
+    t = steps / T
+    f = jnp.cos(((t + s) / (1 + s)) * (jnp.pi / 2)) ** 2
+    f0 = f[0]
+    return f / f0
+
+
+def betas_from_alpha_bar(alpha_bar: jnp.ndarray, beta_min=1e-5, beta_max=0.999) -> jnp.ndarray:
+    """beta_t for t=1..T from alpha_bar[0..T]. Returns length T."""
+    # alpha_bar[t] = prod_{i=1..t} alpha_i
+    # beta_t = 1 - alpha_bar[t]/alpha_bar[t-1]
+    ratio = alpha_bar[1:] / alpha_bar[:-1]
+    betas = 1.0 - ratio
+    return jnp.clip(betas, beta_min, beta_max)
+
+
+def sinusoidal_timestep_embedding(t: jnp.ndarray, dim: int) -> jnp.ndarray:
+    """
+    t: int32/float32 shape (B,)
+    returns: (B, dim)
+    """
+    half = dim // 2
+    freqs = jnp.exp(jnp.linspace(jnp.log(1.0), jnp.log(10000.0), half))
+    args = t[:, None] / freqs[None, :]
+    emb = jnp.concatenate([jnp.sin(args), jnp.cos(args)], axis=-1)
+    if dim % 2 == 1:
+        emb = jnp.pad(emb, ((0, 0), (0, 1)))
+    return emb
+
+
+class EpsMLP(nn.Module):
+    d: int
+    time_dim: int = 128
+    width: int = 256
+    depth: int = 3
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, t: jnp.ndarray) -> jnp.ndarray:
+        # x: (B,d), t: (B,) int
+        temb = sinusoidal_timestep_embedding(t.astype(jnp.float32), self.time_dim)
+        h = jnp.concatenate([x, temb], axis=-1)
+        for _ in range(self.depth):
+            h = nn.Dense(self.width)(h)
+            h = nn.silu(h)
+        h = nn.Dense(self.d)(h)
+        return h
+
+
+@dataclass(frozen=True)
+class DDPMConfig:
+    d: int
+    steps: int = 1000
+    schedule_s: float = 0.008
+    lr: float = 2e-4
+    batch_size: int = 256
+    grad_clip: float = 1.0
+    ema_decay: float = 0.999
+    time_dim: int = 128
+    width: int = 256
+    depth: int = 3
+
+
+class TrainStateEMA(train_state.TrainState):
+    ema_params: Optional[object] = None
+
+
+def _ema_update(ema_params, params, decay: float):
+    return jax.tree.map(lambda e, p: decay * e + (1.0 - decay) * p, ema_params, params)
+
+
+class LatentDDPM:
+    """
+    DDPM prior over vector latents z in R^d.
+    """
+
+    def __init__(self, cfg: DDPMConfig):
+        self.cfg = cfg
+        self.model = EpsMLP(d=cfg.d, time_dim=cfg.time_dim, width=cfg.width, depth=cfg.depth)
+
+        alpha_bar = cosine_alpha_bar(cfg.steps, s=cfg.schedule_s)
+        betas = betas_from_alpha_bar(alpha_bar)
+        alphas = 1.0 - betas
+        alpha_bar_t = jnp.cumprod(alphas)
+
+        self.betas = betas
+        self.alphas = alphas
+        self.alpha_bar = alpha_bar_t  # length T
+        self.sqrt_alpha_bar = jnp.sqrt(alpha_bar_t)
+        self.sqrt_one_minus_alpha_bar = jnp.sqrt(1.0 - alpha_bar_t)
+
+        self.state: Optional[TrainStateEMA] = None
+
+    def init(self, key: jax.Array) -> None:
+        dummy_x = jnp.zeros((1, self.cfg.d), dtype=jnp.float32)
+        dummy_t = jnp.zeros((1,), dtype=jnp.int32)
+        params = self.model.init(key, dummy_x, dummy_t)
+
+        tx = optax.chain(
+            optax.clip_by_global_norm(self.cfg.grad_clip),
+            optax.adamw(self.cfg.lr),
+        )
+        self.state = TrainStateEMA.create(apply_fn=self.model.apply, params=params, tx=tx, ema_params=params)
+
+    def _q_sample(self, x0: jnp.ndarray, t: jnp.ndarray, noise: jnp.ndarray) -> jnp.ndarray:
+        # gather per-example scalars
+        sa = self.sqrt_alpha_bar[t][:, None]
+        so = self.sqrt_one_minus_alpha_bar[t][:, None]
+        return sa * x0 + so * noise
+
+    @jax.jit
+    def _train_step(self, state: TrainStateEMA, x0: jnp.ndarray, key: jax.Array) -> Tuple[TrainStateEMA, jnp.ndarray]:
+        B = x0.shape[0]
+        key_t, key_n = jax.random.split(key, 2)
+        t = jax.random.randint(key_t, (B,), minval=0, maxval=self.cfg.steps, dtype=jnp.int32)
+        noise = jax.random.normal(key_n, x0.shape, dtype=x0.dtype)
+        xt = self._q_sample(x0, t, noise)
+
+        def loss_fn(params):
+            pred = self.model.apply(params, xt, t)
+            loss = jnp.mean((pred - noise) ** 2)
+            return loss
+
+        loss, grads = jax.value_and_grad(loss_fn)(state.params)
+        state = state.apply_gradients(grads=grads)
+        ema = _ema_update(state.ema_params, state.params, self.cfg.ema_decay)
+        state = state.replace(ema_params=ema)
+        return state, loss
+
+    def fit(self, Z: jnp.ndarray, key: jax.Array, num_steps: int = 10_000) -> "LatentDDPM":
+        if self.state is None:
+            self.init(key)
+
+        assert self.state is not None
+        state = self.state
+
+        N = Z.shape[0]
+        bs = self.cfg.batch_size
+
+        for i in range(num_steps):
+            key, k1, k2 = jax.random.split(key, 3)
+            idx = jax.random.randint(k1, (bs,), 0, N)
+            batch = Z[idx]
+            state, loss = self._train_step(state, batch, k2)
+
+            # keep it lightweight; caller can add logging outside
+            if (i + 1) % 1000 == 0:
+                _ = loss  # placeholder for debugging if you want
+
+        self.state = state
+        return self
+
+    def _p_mean_var(self, params, x_t: jnp.ndarray, t: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Compute p(x_{t-1} | x_t): mean and variance (diagonal).
+        """
+        B = x_t.shape[0]
+        tt = jnp.full((B,), t, dtype=jnp.int32)
+        eps = self.model.apply(params, x_t, tt)
+
+        beta_t = self.betas[t]
+        alpha_t = self.alphas[t]
+        ab_t = self.alpha_bar[t]
+
+        # x0_pred = (x_t - sqrt(1-ab)*eps) / sqrt(ab)
+        x0_pred = (x_t - jnp.sqrt(1.0 - ab_t) * eps) / jnp.sqrt(ab_t)
+
+        # posterior mean (DDPM)
+        coef1 = jnp.sqrt(self.alpha_bar[t - 1]) * beta_t / (1.0 - ab_t) if t > 0 else 0.0
+        coef2 = jnp.sqrt(alpha_t) * (1.0 - self.alpha_bar[t - 1]) / (1.0 - ab_t) if t > 0 else 1.0
+        mean = coef1 * x0_pred + coef2 * x_t if t > 0 else x0_pred
+
+        # posterior variance
+        var = beta_t * (1.0 - self.alpha_bar[t - 1]) / (1.0 - ab_t) if t > 0 else 0.0
+        return mean, var
+
+    def sample(self, n: int, key: jax.Array, steps: Optional[int] = None, use_ema: bool = True) -> jnp.ndarray:
+        assert self.state is not None, "Call fit() first."
+        T = self.cfg.steps if steps is None else int(steps)
+        params = self.state.ema_params if use_ema else self.state.params
+
+        key, kx = jax.random.split(key, 2)
+        x = jax.random.normal(kx, (n, self.cfg.d), dtype=jnp.float32)
+
+        for t in range(T - 1, -1, -1):
+            key, kn = jax.random.split(key, 2)
+            mean, var = self._p_mean_var(params, x, t)
+            if t > 0:
+                noise = jax.random.normal(kn, x.shape, dtype=x.dtype)
+                x = mean + jnp.sqrt(var) * noise
+            else:
+                x = mean
+        return x
+
+    def refine(self, z0: jnp.ndarray, key: jax.Array, t_start: int = 200, use_ema: bool = True) -> jnp.ndarray:
+        """
+        Forward-noise z0 to t_start, then reverse to 0.
+        Useful as a "projection/denoising" operator in latent space.
+        """
+        assert self.state is not None, "Call fit() first."
+        t_start = int(jnp.clip(t_start, 0, self.cfg.steps - 1))
+        params = self.state.ema_params if use_ema else self.state.params
+
+        B = z0.shape[0]
+        key, kn = jax.random.split(key, 2)
+        noise = jax.random.normal(kn, z0.shape, dtype=z0.dtype)
+        tvec = jnp.full((B,), t_start, dtype=jnp.int32)
+        x = self._q_sample(z0, tvec, noise)
+
+        for t in range(t_start, -1, -1):
+            key, kn = jax.random.split(key, 2)
+            mean, var = self._p_mean_var(params, x, t)
+            if t > 0:
+                eps = jax.random.normal(kn, x.shape, dtype=x.dtype)
+                x = mean + jnp.sqrt(var) * eps
+            else:
+                x = mean
+        return x
